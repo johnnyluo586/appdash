@@ -16,8 +16,10 @@ import (
 	"errors"
 	htmpl "html/template"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"sort"
 	"strings"
@@ -39,6 +41,8 @@ type App struct {
 
 	tmplLock sync.Mutex
 	tmpls    map[string]*htmpl.Template
+
+	Log *log.Logger
 }
 
 // New creates a new application handler. If r is nil, a new router is
@@ -48,7 +52,7 @@ func New(r *Router) *App {
 		r = NewRouter(nil)
 	}
 
-	app := &App{Router: r}
+	app := &App{Router: r, Log: log.New(os.Stderr, "appdash: ", log.LstdFlags)}
 
 	r.r.Get(RootRoute).Handler(handlerFunc(app.serveRoot))
 	r.r.Get(TraceRoute).Handler(handlerFunc(app.serveTrace))
@@ -110,8 +114,16 @@ func (a *App) serveTrace(w http.ResponseWriter, r *http.Request) error {
 		return a.profile(trace, w)
 	}
 
+	// Do not show d3 timeline chart when timeline item fields are invalid.
+	// So we avoid JS code breaking due missing values.
+	var showTimelineChart bool = true
 	visData, err := a.d3timeline(trace)
-	if err != nil {
+	switch err {
+	case errTimelineItemValidation:
+		showTimelineChart = false
+	case nil:
+		break
+	default:
 		return err
 	}
 
@@ -128,13 +140,15 @@ func (a *App) serveTrace(w http.ResponseWriter, r *http.Request) error {
 
 	return a.renderTemplate(w, r, "trace.html", http.StatusOK, &struct {
 		TemplateCommon
-		Trace      *appdash.Trace
-		VisData    []timelineItem
-		ProfileURL string
+		Trace             *appdash.Trace
+		ShowTimelineChart bool
+		VisData           []timelineItem
+		ProfileURL        string
 	}{
-		Trace:      trace,
-		VisData:    visData,
-		ProfileURL: profile.String(),
+		Trace:             trace,
+		ShowTimelineChart: showTimelineChart,
+		VisData:           visData,
+		ProfileURL:        profile.String(),
 	})
 }
 

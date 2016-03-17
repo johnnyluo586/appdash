@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"sort"
+
 	"sourcegraph.com/sourcegraph/appdash/internal/wire"
 )
 
@@ -211,6 +213,8 @@ func TestChunkedCollector(t *testing.T) {
 		newCollectPacket(SpanID{1, 2, 3}, Annotations{{"k1", []byte("v1")}, {"k2", []byte("v2")}, {"k4", []byte("v4")}}),
 		newCollectPacket(SpanID{2, 3, 4}, Annotations{{"k3", []byte("v3")}}),
 	}
+	sort.Sort(byTraceID(packets))
+	sort.Sort(byTraceID(want))
 	if !reflect.DeepEqual(packets, want) {
 		t.Errorf("after MinInterval: got packets == %v, want %v", packets, want)
 	}
@@ -222,6 +226,31 @@ func TestChunkedCollector(t *testing.T) {
 	time.Sleep(cc.MinInterval * 2)
 	if len(packets) != lenBeforeStop {
 		t.Errorf("after Stop: got len(packets) == %d, want %d", len(packets), lenBeforeStop)
+	}
+}
+
+func TestChunkedCollectorFlushTimeout(t *testing.T) {
+	mc := collectorFunc(func(span SpanID, anns ...Annotation) error {
+		time.Sleep(200 * time.Millisecond) // Slow collector
+		return nil
+	})
+
+	cc := &ChunkedCollector{
+		Collector:    mc,
+		MinInterval:  10 * time.Millisecond,
+		FlushTimeout: 1 * time.Second,
+	}
+
+	for i := 0; i < 100; i++ {
+		cc.Collect(NewRootSpanID(), Annotation{"k1", []byte("v1")})
+	}
+
+	err := cc.Flush()
+	if err != ErrQueueDropped {
+		t.Fatal("got", err, "expected", ErrQueueDropped)
+	}
+	if len(cc.pendingBySpanID) != 0 {
+		t.Fatal("got", len(cc.pendingBySpanID), "queued but expected 0")
 	}
 }
 
@@ -315,3 +344,9 @@ func BenchmarkChunkedCollector500(b *testing.B) {
 		}
 	}
 }
+
+type byTraceID []*wire.CollectPacket
+
+func (bt byTraceID) Len() int           { return len(bt) }
+func (bt byTraceID) Swap(i, j int)      { bt[i], bt[j] = bt[j], bt[i] }
+func (bt byTraceID) Less(i, j int) bool { return *bt[i].Spanid.Trace < *bt[j].Spanid.Trace }

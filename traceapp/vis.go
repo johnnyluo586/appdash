@@ -1,6 +1,7 @@
 package traceapp
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"time"
@@ -13,6 +14,10 @@ import (
 	_ "sourcegraph.com/sourcegraph/appdash/sqltrace"
 )
 
+// errTimelineItemValidation is returned by timelineItem.Valid when either
+// timelineItem.Label or timelime.ItemFullLabel are empty.
+var errTimelineItemValidation = errors.New("timeline item validation error")
+
 type timelineItem struct {
 	Label        string                  `json:"label"`
 	FullLabel    string                  `json:"fullLabel"`
@@ -24,10 +29,20 @@ type timelineItem struct {
 	Visible      bool                    `json:"visible"`
 }
 
+func (tl *timelineItem) Valid() bool {
+	// d3 timeline chart depends on
+	// item.Label & item.FullLabel
+	if tl.Label == "" || tl.FullLabel == "" {
+		return false
+	}
+	return true
+}
+
 type timelineItemTimespan struct {
-	Label string `json:"label"`
-	Start int64  `json:"starting_time"` // msec since epoch
-	End   int64  `json:"ending_time"`   // msec since epoch
+	Label    string `json:"label"`
+	Start    int64  `json:"starting_time"` // msec since epoch
+	End      int64  `json:"ending_time"`   // msec since epoch
+	Duration int64  `json:"duration"`
 }
 
 func (a *App) d3timeline(t *appdash.Trace) ([]timelineItem, error) {
@@ -57,18 +72,18 @@ func (a *App) d3timelineInner(t *appdash.Trace, depth int) ([]timelineItem, erro
 		}
 	}
 
-	name := t.Span.Name()
-	if len(name) > 13 {
-		name = name[:13]
-		name += "…"
-	}
 	item := timelineItem{
-		Label:     name,
+		Label:     t.Span.Name(),
 		FullLabel: t.Span.Name(),
 		Data:      t.Annotations.StringMap(),
 		SpanID:    t.Span.ID.Span.String(),
 		URL:       u.String(),
 	}
+
+	if !item.Valid() {
+		return nil, errTimelineItemValidation
+	}
+
 	if t.Span.ID.Parent != 0 {
 		item.ParentSpanID = t.Span.ID.Parent.String()
 	}
@@ -77,6 +92,15 @@ func (a *App) d3timelineInner(t *appdash.Trace, depth int) ([]timelineItem, erro
 	}
 	for _, e := range events {
 		if e, ok := e.(appdash.TimespanEvent); ok {
+			// Continue to next iteration
+			// if e.Start() or e.End() are empty time values.
+			if e.Start() == (time.Time{}) || e.End() == (time.Time{}) {
+				if a.Log != nil {
+					a.Log.Printf("Found a TimespanEvent: %+v with invalid/zero times.", e)
+				}
+				// Continuing so frontend does not break due to current event missing start/end time values.
+				continue
+			}
 			start := e.Start().UnixNano() / int64(time.Millisecond)
 			end := e.End().UnixNano() / int64(time.Millisecond)
 			ts := timelineItemTimespan{
@@ -104,6 +128,7 @@ func (a *App) d3timelineInner(t *appdash.Trace, depth int) ([]timelineItem, erro
 		msec := time.Duration(item.Times[0].End-item.Times[0].Start) * time.Millisecond
 		if msec > 0 {
 			ts.Label = fmt.Sprintf("%s (%s)", item.Label, msec)
+			ts.Duration = int64(msec)
 		}
 	}
 	if len(item.Times) == 0 {
