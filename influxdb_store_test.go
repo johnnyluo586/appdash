@@ -9,13 +9,72 @@ import (
 	influxDBServer "github.com/influxdata/influxdb/cmd/influxd/run"
 )
 
-const (
-	clientEventKey    string = schemaPrefix + clientEventSchema
-	clientEventSchema string = "HTTPClient"
-	serverEventKey    string = schemaPrefix + serverEventSchema
-	serverEventSchema string = "HTTPServer"
-	spanNameSchema    string = "name"
-)
+func TestAddChildren(t *testing.T) {
+	root := &Trace{Span: Span{ID: SpanID{1, 100, 0}}}
+	want := &Trace{
+		Span: root.Span,
+		Sub: []*Trace{
+			&Trace{
+				Span: Span{ID: SpanID{1, 101, 100}},
+				Sub: []*Trace{
+					&Trace{
+						Span: Span{ID: SpanID{1, 1011, 101}},
+						Sub: []*Trace{
+							&Trace{
+								Span: Span{ID: SpanID{1, 10111, 1011}},
+							},
+							&Trace{
+								Span: Span{ID: SpanID{1, 10112, 1011}},
+							},
+						},
+					},
+					&Trace{
+						Span: Span{ID: SpanID{1, 1012, 101}},
+					},
+				},
+			},
+			&Trace{
+				Span: Span{ID: SpanID{1, 102, 100}},
+				Sub: []*Trace{
+					&Trace{
+						Span: Span{ID: SpanID{1, 1021, 102}},
+						Sub: []*Trace{
+							&Trace{
+								Span: Span{ID: SpanID{1, 10211, 1021}},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	var (
+		children      []*Trace
+		sortSubTraces func(root *Trace)
+		subTraces     func(root *Trace, traces []*Trace) []*Trace
+	)
+	subTraces = func(root *Trace, traces []*Trace) []*Trace {
+		traces = append(traces, root.Sub...)
+		for _, sub := range root.Sub {
+			subTraces(sub, traces)
+		}
+		return traces
+	}
+	sortSubTraces = func(root *Trace) {
+		sort.Sort(tracesByIDSpan(root.Sub))
+		for _, sub := range root.Sub {
+			sortSubTraces(sub)
+		}
+	}
+	if err := addChildren(root, subTraces(want, children)); err != nil {
+		t.Fatal(err)
+	}
+	sortSubTraces(root)
+	sortSubTraces(want)
+	if !reflect.DeepEqual(root, want) {
+		t.Fatalf("got: %v, want: %v", root, want)
+	}
+}
 
 func TestMergeSchemasField(t *testing.T) {
 	cases := []struct {
@@ -115,7 +174,10 @@ func TestFindTraceParent(t *testing.T) {
 }
 
 func TestInfluxDBStore(t *testing.T) {
-	store := newStore(t)
+	store, err := newTestInfluxDBStore()
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer func() {
 		if err := store.Close(); err != nil {
 			t.Fatal(err)
@@ -127,9 +189,7 @@ func TestInfluxDBStore(t *testing.T) {
 				ID: SpanID{1, 100, 0},
 				Annotations: Annotations{
 					Annotation{Key: "Name", Value: []byte("/")},
-					Annotation{Key: "Server.Request.Method", Value: []byte("GET")},
-					Annotation{Key: clientEventKey, Value: []byte("")},
-					Annotation{Key: serverEventKey, Value: []byte("")},
+					Annotation{Key: "_schema:name"},
 				},
 			},
 			Sub: []*Trace{
@@ -138,9 +198,7 @@ func TestInfluxDBStore(t *testing.T) {
 						ID: SpanID{Trace: 1, Span: 11, Parent: 100},
 						Annotations: Annotations{
 							Annotation{Key: "Name", Value: []byte("localhost:8699/endpoint")},
-							Annotation{Key: "Server.Request.Method", Value: []byte("GET")},
-							Annotation{Key: clientEventKey, Value: []byte("")},
-							Annotation{Key: serverEventKey, Value: []byte("")},
+							Annotation{Key: "_schema:name"},
 						},
 					},
 					Sub: []*Trace{
@@ -149,9 +207,7 @@ func TestInfluxDBStore(t *testing.T) {
 								ID: SpanID{Trace: 1, Span: 111, Parent: 11},
 								Annotations: Annotations{
 									Annotation{Key: "Name", Value: []byte("localhost:8699/sub1")},
-									Annotation{Key: "Server.Request.Method", Value: []byte("GET")},
-									Annotation{Key: clientEventKey, Value: []byte("")},
-									Annotation{Key: serverEventKey, Value: []byte("")},
+									Annotation{Key: "_schema:name"},
 								},
 							},
 							Sub: []*Trace{
@@ -160,9 +216,7 @@ func TestInfluxDBStore(t *testing.T) {
 										ID: SpanID{Trace: 1, Span: 1111, Parent: 111},
 										Annotations: Annotations{
 											Annotation{Key: "Name", Value: []byte("localhost:8699/sub2")},
-											Annotation{Key: "Server.Request.Method", Value: []byte("GET")},
-											Annotation{Key: clientEventKey, Value: []byte("")},
-											Annotation{Key: serverEventKey, Value: []byte("")},
+											Annotation{Key: "_schema:name"},
 										},
 									},
 								},
@@ -177,9 +231,7 @@ func TestInfluxDBStore(t *testing.T) {
 				ID: SpanID{2, 200, 0},
 				Annotations: Annotations{
 					Annotation{Key: "Name", Value: []byte("/")},
-					Annotation{Key: "Server.Request.Method", Value: []byte("GET")},
-					Annotation{Key: clientEventKey, Value: []byte("")},
-					Annotation{Key: serverEventKey, Value: []byte("")},
+					Annotation{Key: "_schema:name"},
 				},
 			},
 		},
@@ -254,12 +306,276 @@ func TestInfluxDBStore(t *testing.T) {
 	}
 }
 
-func newStore(t *testing.T) *InfluxDBStore {
+func benchmarkInfluxDBStoreCollect(b *testing.B, n int) {
+	b.StopTimer()
+	store, err := newTestInfluxDBStore()
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}()
+	b.StartTimer()
+	var x ID
+	for n := 0; n < b.N; n++ {
+		for c := 0; c < n; c++ {
+			x++
+			spanID := SpanID{x, x + 1, 0}
+			anns := []Annotations{
+				Annotations{
+					Annotation{Key: "Server.Request.Method", Value: []byte("GET")},
+					Annotation{Key: "Server.Request.Headers.User-Agent", Value: []byte("Go-http-client/1.1")},
+					Annotation{Key: "_schema:HTTPServer", Value: []byte("")},
+				},
+				Annotations{
+					Annotation{Key: "Name", Value: []byte("/")},
+				},
+				Annotations{
+					Annotation{Key: "Client.Response.Headers.Content-Type", Value: []byte("text/plain; charset=utf-8")},
+					Annotation{Key: "Client.Response.Headers.Content-Length", Value: []byte("16")},
+					Annotation{Key: "_schema:HTTPClient", Value: []byte("")},
+				},
+			}
+			for ann := 0; ann < len(anns); ann++ {
+				if err := store.Collect(spanID, anns[ann]...); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}
+	}
+	b.StopTimer()
+}
+
+func BenchmarkInfluxDBStoreCollect100(b *testing.B) {
+	benchmarkInfluxDBStoreCollect(b, 100)
+}
+
+func BenchmarkInfluxDBStoreCollect250(b *testing.B) {
+	benchmarkInfluxDBStoreCollect(b, 250)
+}
+
+func BenchmarkInfluxDBStoreCollect1000(b *testing.B) {
+	benchmarkInfluxDBStoreCollect(b, 1000)
+}
+
+func BenchmarkInfluxDBStoreCollectParallel(b *testing.B) {
+	b.StopTimer()
+	store, err := newTestInfluxDBStore()
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}()
+	b.StartTimer()
+	var x ID
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			x++
+			spanID := SpanID{x, x + 1, 0}
+			anns := []Annotations{
+				Annotations{
+					Annotation{Key: "Server.Request.Method", Value: []byte("GET")},
+					Annotation{Key: "Server.Request.Headers.User-Agent", Value: []byte("Go-http-client/1.1")},
+					Annotation{Key: "_schema:HTTPServer", Value: []byte("")},
+				},
+				Annotations{
+					Annotation{Key: "Name", Value: []byte("/")},
+				},
+				Annotations{
+					Annotation{Key: "Client.Response.Headers.Content-Type", Value: []byte("text/plain; charset=utf-8")},
+					Annotation{Key: "Client.Response.Headers.Content-Length", Value: []byte("16")},
+					Annotation{Key: "_schema:HTTPClient", Value: []byte("")},
+				},
+			}
+			for ann := 0; ann < len(anns); ann++ {
+				if err := store.Collect(spanID, anns[ann]...); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}
+	})
+	b.StopTimer()
+}
+
+func benchmarkInfluxDBStoreTrace(b *testing.B, n int) {
+	b.StopTimer()
+	store, err := newTestInfluxDBStore()
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}()
+	traces, err := benchmarkInfluxDBStoreCreateTraces(store, n)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.StartTimer()
+	for n := 0; n < b.N; n++ {
+		for _, trace := range traces {
+			if _, err := store.Trace(trace.ID.Trace); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+	b.StopTimer()
+}
+
+func BenchmarkInfluxDBStoreTrace100(b *testing.B) {
+	benchmarkInfluxDBStoreTrace(b, 100)
+}
+
+func BenchmarkInfluxDBStoreTrace250(b *testing.B) {
+	benchmarkInfluxDBStoreTrace(b, 250)
+}
+
+func BenchmarkInfluxDBStoreTrace1000(b *testing.B) {
+	benchmarkInfluxDBStoreTrace(b, 1000)
+}
+
+func benchmarkInfluxDBStoreTraces(b *testing.B, n int) {
+	b.StopTimer()
+	store, err := newTestInfluxDBStore()
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}()
+	if _, err := benchmarkInfluxDBStoreCreateTraces(store, n); err != nil {
+		b.Fatal(err)
+	}
+	b.StartTimer()
+	for n := 0; n < b.N; n++ {
+		if _, err := store.Traces(); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
+}
+
+func BenchmarkInfluxDBStoreTracesDefaultPerPage(b *testing.B) {
+	benchmarkInfluxDBStoreTraces(b, defaultTracesPerPage)
+}
+
+func benchmarkInfluxDBStoreCreateTraces(store *InfluxDBStore, n int) ([]*Trace, error) {
+	var (
+		mustCollect    func(trace *Trace) error
+		mustCollectAll func(trace *Trace) error
+	)
+	mustCollect = func(trace *Trace) error {
+		if err := store.Collect(trace.Span.ID, trace.Span.Annotations...); err != nil {
+			return err
+		}
+		return nil
+	}
+	mustCollectAll = func(trace *Trace) error {
+		if err := mustCollect(trace); err != nil {
+			return err
+		}
+		for _, sub := range trace.Sub {
+			if err := mustCollect(sub); err != nil {
+				return err
+			}
+			if err := mustCollectAll(sub); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	var (
+		// Initial ID's for traces & sub-traces.
+		x      ID    = ID(0)     // Root.
+		s0     ID    = ID(n)     // Sub 0.
+		s1     ID    = ID(n * 2) // Sub 1.
+		s2     ID    = ID(n * 3) // Sub 2.
+		s3     ID    = ID(n * 4) // Sub 3.
+		ids    []*ID = []*ID{&x, &s0, &s1, &s2, &s3}
+		traces []*Trace
+	)
+	for c := 0; c < n; c++ {
+		for _, id := range ids {
+			*id++
+		}
+		trace := Trace{
+			Span: Span{
+				ID: SpanID{x, s0, 0},
+				Annotations: []Annotation{
+					Annotation{Key: "Server.Request.Method", Value: []byte("GET")},
+					Annotation{Key: "Server.Request.Headers.User-Agent", Value: []byte("Go-http-client/1.1")},
+					Annotation{Key: "_schema:HTTPServer", Value: []byte("")},
+					Annotation{Key: "Name", Value: []byte("/")},
+					Annotation{Key: "Client.Response.Headers.Content-Type", Value: []byte("text/plain; charset=utf-8")},
+					Annotation{Key: "Client.Response.Headers.Content-Length", Value: []byte("16")},
+					Annotation{Key: "_schema:HTTPClient", Value: []byte("")},
+				},
+			},
+			Sub: []*Trace{
+				&Trace{
+					Span: Span{
+						ID: SpanID{Trace: x, Span: s1, Parent: s0},
+						Annotations: Annotations{
+							Annotation{Key: "Name", Value: []byte("localhost:8699/endpoint")},
+							Annotation{Key: "Server.Request.Method", Value: []byte("GET")},
+							Annotation{Key: "_schema:HTTPClient", Value: []byte("")},
+							Annotation{Key: "_schema:HTTPServer", Value: []byte("")},
+						},
+					},
+					Sub: []*Trace{
+						&Trace{
+							Span: Span{
+								ID: SpanID{Trace: x, Span: s2, Parent: s1},
+								Annotations: Annotations{
+									Annotation{Key: "Name", Value: []byte("localhost:8699/sub1")},
+									Annotation{Key: "Server.Request.Method", Value: []byte("GET")},
+									Annotation{Key: "_schema:HTTPClient", Value: []byte("")},
+									Annotation{Key: "_schema:HTTPServer", Value: []byte("")},
+								},
+							},
+							Sub: []*Trace{
+								&Trace{
+									Span: Span{
+										ID: SpanID{Trace: x, Span: s3, Parent: s2},
+										Annotations: Annotations{
+											Annotation{Key: "Name", Value: []byte("localhost:8699/sub2")},
+											Annotation{Key: "Server.Request.Method", Value: []byte("GET")},
+											Annotation{Key: "_schema:HTTPClient", Value: []byte("")},
+											Annotation{Key: "_schema:HTTPServer", Value: []byte("")},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+		if err := mustCollectAll(&trace); err != nil {
+			return nil, err
+		}
+		traces = append(traces, &trace)
+	}
+	return traces, nil
+}
+
+func newTestInfluxDBStore() (*InfluxDBStore, error) {
 	conf, err := influxDBServer.NewDemoConfig()
 	if err != nil {
-		t.Fatalf("failed to create influxdb config, error: %v", err)
+		return nil, err
 	}
+	conf.Data.QueryLogEnabled = false
 	conf.HTTPD.AuthEnabled = true
+	conf.HTTPD.LogEnabled = false
+	conf.ReportingDisabled = true
 	user := InfluxDBAdminUser{Username: "demo", Password: "demo"}
 	defaultRP := InfluxDBRetentionPolicy{Name: "one_hour_only", Duration: "1h"}
 	store, err := NewInfluxDBStore(InfluxDBStoreConfig{
@@ -270,9 +586,9 @@ func newStore(t *testing.T) *InfluxDBStore {
 		Server:    conf,
 	})
 	if err != nil {
-		t.Fatalf("failed to create influxdb store, error: %v", err)
+		return nil, err
 	}
-	return store
+	return store, nil
 }
 
 // removeInfluxDBAnnotations removes annotations from `root` and it's subtraces; only those annotations that have as key present on `keys` will be removed.

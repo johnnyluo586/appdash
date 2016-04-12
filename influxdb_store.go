@@ -147,11 +147,6 @@ func (in *InfluxDBStore) Trace(id ID) (*Trace, error) {
 		if err != nil {
 			return nil, err
 		}
-		annotations, err := annotationsFromRow(&s)
-		if err != nil {
-			return trace, nil
-		}
-		span.Annotations = filterSchemas(*annotations)
 		if span.ID.IsRoot() && rootSpanSet {
 			return nil, errors.New("unexpected multiple root spans")
 		}
@@ -196,11 +191,6 @@ func (in *InfluxDBStore) Traces() ([]*Trace, error) {
 		if err != nil {
 			return nil, err
 		}
-		annotations, err := annotationsFromRow(&s)
-		if err != nil {
-			return nil, err
-		}
-		span.Annotations = *annotations
 		_, present := tracesCache[span.ID.Trace]
 		if !present {
 			tracesCache[span.ID.Trace] = &Trace{Span: *span}
@@ -236,11 +226,6 @@ func (in *InfluxDBStore) Traces() ([]*Trace, error) {
 		if err != nil {
 			return nil, err
 		}
-		annotations, err := annotationsFromRow(&s)
-		if err != nil {
-			return nil, err
-		}
-		span.Annotations = filterSchemas(*annotations)
 		trace, present := tracesCache[span.ID.Trace]
 		if !present { // Root trace not added.
 			return nil, errors.New("parent not found")
@@ -434,6 +419,24 @@ func (in *InfluxDBStore) setUpTestMode() error {
 	return nil
 }
 
+func annotationsFromEvents(a Annotations) (Annotations, error) {
+	var (
+		annotations Annotations
+		events      []Event
+	)
+	if err := UnmarshalEvents(a, &events); err != nil {
+		return nil, err
+	}
+	for _, e := range events {
+		anns, err := MarshalEvent(e)
+		if err != nil {
+			return nil, err
+		}
+		annotations = append(annotations, anns...)
+	}
+	return annotations, nil
+}
+
 func annotationsFromRow(r *influxDBModels.Row) (*Annotations, error) {
 	// Actually an influxDBModels.Row represents a single InfluxDB serie.
 	// r.Values[n] is a slice containing span's annotation values.
@@ -617,10 +620,9 @@ func schemasFromAnnotations(anns []Annotation) string {
 // addChildren adds `children` to `root`; each child is appended to it's trace parent.
 func addChildren(root *Trace, children []*Trace) error {
 	var (
-		addFn         func() // Handles children appending to it's trace parent.
-		errMaxRetries error  = errors.New("maximum number of retries")
-		retries       int    = len(children) // Maximum number of retries to add `children` elements to `root`.
-		try           int                    // Current number of try to add `children` elements to `root`.
+		addFn   func()                 // Handles children appending to it's trace parent.
+		retries int    = len(children) // Maximum number of retries to add `children` elements to `root`.
+		try     int                    // Current number of try to add `children` elements to `root`.
 	)
 	addFn = func() {
 		for i := len(children) - 1; i >= 0; i-- {
@@ -644,8 +646,22 @@ func addChildren(root *Trace, children []*Trace) error {
 		if len(children) == 0 {
 			break
 		}
+
+		// At this point, all children were added to their parent spans. Any children
+		// left over in the children slice do not have parents. This could happen if,
+		// for example, a parent service fails to record its span information to the
+		// collection server but its downstream services do send their span information
+		// properly. In this case, we gracefully degrade by adding these orphan spans to
+		// the root span.
 		if try == retries {
-			return errMaxRetries
+
+			// Iterates over children(without parent found on `root`) and appends them as sub-traces to `root`.
+			for _, child := range children {
+				if child.ID.Trace == root.ID.Trace {
+					root.Sub = append(root.Sub, child)
+				}
+			}
+			return nil
 		}
 		addFn()
 		try++
@@ -691,6 +707,15 @@ func newSpanFromRow(r *influxDBModels.Row) (*Span, error) {
 		Span:   ID(spanID),
 		Parent: ID(parentID),
 	}
+	annotations, err := annotationsFromRow(r)
+	if err != nil {
+		return nil, err
+	}
+	anns, err := annotationsFromEvents(filterSchemas(*annotations))
+	if err != nil {
+		return nil, err
+	}
+	span.Annotations = anns
 	return span, nil
 }
 
